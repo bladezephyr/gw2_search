@@ -1,0 +1,836 @@
+#!/usr/bin/python
+
+import sys, os
+import copy
+import aiohttp
+import asyncio
+import argparse
+import json
+import re
+import logging
+
+# Request base class
+class Request(object):
+    # for now just support get & post
+    GET = 1
+    POST = 2
+
+    def __init__(self, url, method, data=''):
+        self.url = url
+        self.method = method
+        self.headers = None
+        self.data = data
+        self.response = Response()
+ 
+    def __repr__(self):
+        return f"url='{self.url}', method={self.method}, headers='{self.headers}' response={self.response}"
+
+# Response Base Class
+class Response(object):
+    def __init__(self):
+        self.data = None
+        self.text = None
+
+    async def parse(self, response):
+        self.data = response
+        self.text = await response.text()
+
+    def get_content(self):
+        return self.text
+
+# HTTP request engine
+class AsyncIOHTTP(object):
+    def __init__(self, client, verbose=False):
+        self.client = client
+        self.tasks = []
+        self.verbose = verbose
+    
+    async def send(self, request):
+        if request.method == Request.GET:
+            await request.response.parse(await self.client.get(request.url, headers=request.headers))
+        elif request.method == Request.POST:
+            await request.response.parse(await self.client.post(request.url, headers=request.headers, data=request.data))
+        return request.response
+
+    async def add_request(self, request):
+        task = asyncio.create_task(self.send(request))
+        self.tasks.append(task)
+        
+    async def sync(self):
+        rc = await asyncio.gather(*self.tasks)
+        self.tasks = []
+        return rc
+
+# GW2 API request types
+
+class GW2APIRequest(Request):
+    def __init__(self, ctx, url, auth):
+        self.base_url = "https://api.guildwars2.com/v2"
+        self.ctx = ctx
+        Request.__init__(self, f"{self.base_url}/{url}", Request.GET)
+        self.auth_header = { "Authorization": f"Bearer {auth}" }
+        self.headers = self.auth_header
+        self.response = JSONResponse(ctx)
+
+
+# request types for the definitions of things
+
+class StatComboRequest(GW2APIRequest):
+    def __init__(self, ctx, auth):
+        GW2APIRequest.__init__(self, ctx, "itemstats?ids=all", auth)
+        self.response = StatComboResponse(ctx)
+
+class MaterialsCategoriesRequest(GW2APIRequest):
+    def __init__(self, ctx, auth, category=None):
+        url = 'materials?ids=all'
+        GW2APIRequest.__init__(self, ctx, 'materials?ids=all', auth)
+        self.response = MaterialsCategoriesResponse(ctx)
+
+class ItemsRequest(GW2APIRequest):
+    def __init__(self, ctx, ids, auth):
+        GW2APIRequest.__init__(self, ctx, f"items?ids={ids}", auth)
+        self.response = ItemsResponse(ctx)
+        if args.debug:
+            print(f"  fetching definition for ids: {ids}")
+
+# Request types for player data
+
+class CharacterRequest(GW2APIRequest):
+    def __init__(self, ctx, auth):
+        GW2APIRequest.__init__(self, ctx, "characters?ids=all", auth)
+        self.response = CharacterResponse(ctx)
+
+class BankRequest(GW2APIRequest):
+    def __init__(self, ctx, auth):
+        GW2APIRequest.__init__(self, ctx, "account/bank", auth)
+        self.response = BankResponse(ctx)
+
+class SharedInventoryRequest(GW2APIRequest):
+    def __init__(self, ctx, auth):
+        GW2APIRequest.__init__(self, ctx, "account/inventory", auth)
+        self.response = SharedInventoryResponse(ctx)
+
+class MaterialsRequest(GW2APIRequest):
+    def __init__(self, ctx, auth):
+        GW2APIRequest.__init__(self, ctx, "account/materials", auth)
+        self.response = MaterialsResponse(ctx)
+
+class LegendaryArmoryRequest(GW2APIRequest):
+    def __init__(self, ctx, auth):
+        GW2APIRequest.__init__(self, ctx, "account/legendaryarmory", auth)
+        self.response = LegendaryArmoryResponse(ctx)
+
+# GW2 Response objects
+
+# API returns everything as JSON
+class JSONResponse(Response):
+    def __init__(self, ctx):
+        Response.__init__(self)
+        self.ctx = ctx
+        self.json = None
+
+    async def parse(self, response):
+        self.json = await response.json()
+
+    def get_content(self):
+        return self.json
+
+class StatComboResponse(JSONResponse):
+    def __init__(self, ctx):
+        JSONResponse.__init__(self, ctx)
+
+    async def parse(self, response):
+        self.json = await response.json()
+        self.ctx.stats_table = {}
+        if self.ctx.args.debug:
+            print("Fetched stat combinations")
+        for stat in self.json:
+            self.ctx.stats_table[stat['id']] = stat['name']
+        if self.ctx.args.debug:
+            for stat in self.ctx.stats_table.keys():
+                print(f"  {stat}: {self.ctx.stats_table[stat]}")
+
+class CharacterResponse(JSONResponse):
+    def __init__(self, ctx):
+        JSONResponse.__init__(self, ctx)
+
+    async def parse(self, response):
+        self.ctx.characters = await response.json()
+        if args.debug:
+            print("Fetched account characters")
+            for char in self.ctx.characters:
+                print(f"  found character {char['name']}")
+
+class BankResponse(JSONResponse):
+    def __init__(self, ctx):
+        JSONResponse.__init__(self, ctx)
+
+    async def parse(self, response):
+        self.ctx.bank = await response.json()
+        if args.debug:
+            print("Fetched items from bank.")
+        for item in self.ctx.bank:
+            if item is not None:
+                if args.debug:
+                    print(f"  fetched item {item['id']} from bank")
+
+
+class SharedInventoryResponse(JSONResponse):
+    def __init__(self, ctx):
+        JSONResponse.__init__(self, ctx)
+
+    async def parse(self, response):
+        self.ctx.shared_inventory = await response.json()
+        if args.debug:
+            print("Fetched items from shared inventory.")
+            for item in self.ctx.shared_inventory:
+                if item is not None:
+                    print(f"  fetched item {item['id']} from shared inventory")
+
+class MaterialsResponse(JSONResponse):
+    def __init__(self, ctx):
+        JSONResponse.__init__(self, ctx)
+
+    async def parse(self, response):
+        self.ctx.materials = await response.json()
+        if args.debug:
+            print("Fetched items from materials.")
+            for item in self.ctx.materials:
+                print(f"  fetched item {item['id']} from material storage")
+
+class MaterialsCategoriesResponse(JSONResponse):
+    def __init__(self, ctx):
+        JSONResponse.__init__(self, ctx)
+
+    async def parse(self, response):
+        # Child response.  Add its materials to the materials map, but only
+        # if the player has some of the given material.
+        categories = await response.json()
+        if args.debug:
+            print(f"Fetched categories in materials storage")
+        for category in categories:
+            if category is not None and 'id' in category:
+                self.ctx.materials_categories[category['id']] = category
+                if args.debug:
+                    print(f"  fetched category {category['name']}")
+
+class LegendaryArmoryResponse(JSONResponse):
+    def __init__(self, ctx):
+        JSONResponse.__init__(self, ctx)
+
+    async def parse(self, response):
+        self.ctx.legendary_armory = await response.json()
+        if args.debug:
+            print("Fetched items from legendary_armory.")
+            for item in self.ctx.legendary_armory:
+                print(f"  fetched item {item['id']} from legendary armory")
+
+class ItemsResponse(JSONResponse):
+    def __init__(self, ctx):
+        JSONResponse.__init__(self, ctx)
+
+    async def parse(self, response):
+        self.data = response
+        self.json = await response.json()
+
+    def get_content(self):
+        if args.debug:
+            print("Fetched item definitions for found items.")
+            for item in self.json:
+                print(f"  fetched item definition {item['name']}")
+        return self.json
+        
+# GW2 Object Classes
+
+class ItemDetails(object):
+    def __init__(self, item, location, bound_to=None):
+        self.item = item
+        self.count = None
+        if 'count' in item:
+            self.count = int(item['count'])
+        self.location = location
+        self.stat_id = None
+        self.bound_to = bound_to
+
+    def get_adjusted_name(self, stat_table, item):
+        name = item['name']
+        if self.stat_id is not None:
+            stat = stat_table[self.stat_id]
+            name = f"{name} ({stat})"
+        if self.bound_to:
+            name = f"{name} (bound to {self.bound_to})"
+        if self.count and self.count > 1:
+            name = f"({self.count}) {name}"
+        return name
+
+class Location(object):
+    INVENTORY = 1
+    EQUIPPED = 2
+    BANK = 3
+    MATERIAL_STORAGE = 4
+    SHARED = 5
+    GEAR = 6
+    ARMORY = 7
+    Names = ['Inventory', 'Equipped', "Bank Tab", "Material Storage", "Shared Inventory", "Gear", "Legendary Armory"]
+
+    def __init__(self, location, row, slot):
+        self.location = location
+        self.loc_description = Location.Names[location - 1]
+        self.row = row
+        self.row_name = None
+        self.slot = slot
+        self.slot_name = "slot"
+        if location == Location.INVENTORY:
+            self.row_name = "bag slot"
+        elif location == Location.BANK:
+            self.row_name = "bank tab"
+        elif location == Location.SHARED:
+            self.slot_name = "shared slot"
+
+    def __str__(self):
+        rc = f"{self.loc_description}: "
+        if self.row_name:
+            rc += f"{self.row_name} "
+        if self.row is not None:
+            rc += f"{self.row} "
+        rc += f"{self.slot_name} {self.slot}"
+        return rc
+
+class Inventory(Location):
+    def __init__(self, character, bag_slot, slot):
+        Location.__init__(self, Location.INVENTORY, bag_slot, slot)
+        self.toon_name = character
+
+    def __str__(self):
+        rc = f"{self.toon_name}: bag slot {self.row}, slot {self.slot}"
+        return rc
+
+class Equipped(Location):
+    def __init__(self, toon_name, slot_name):
+        Location.__init__(self, Location.EQUIPPED, None, None)
+        self.toon_name = toon_name
+        self.slot_name = slot_name
+
+    def __str__(self):
+        rc = f"{self.toon_name}: equipped in {self.slot_name}"
+        return rc
+        
+class MaterialStorage(Location):
+    def __init__(self, item, materials_categories):
+        self.category_name = None
+        self.row = None
+        self.slot = None
+
+        # FIXME: This error checking should really throw an exception, since
+        # it's a programming error if we're trying to look up materials storage
+        # names before we've fetched them, or we don't have an item...
+        if item is None:
+            return
+        if 'category' not in item:
+            return
+        if materials_categories is None:
+            return
+
+        item_category_id = item['category']
+        category = materials_categories[item_category_id]
+        self.category_name = category['name']
+        position = None
+        i = 1
+        for item_id in category['items']:
+            if item_id == item['id']:
+                position = i
+                break
+            i += 1
+        row = 1 + int((position - 1) / 10)
+        slot = 1 + int((position -1) % 10)
+        Location.__init__(self, Location.MATERIAL_STORAGE, row, slot)
+
+    def __str__(self):
+        return f"Material Storage: {self.category_name}, row {self.row}, slot {self.slot}"
+
+class Upgrade(Location):
+    def __init__(self, parent_details):
+        Location.__init__(self, Location.GEAR, None, None)
+        self.parent_details = parent_details
+
+    def __str__(self):
+        return f"{self.parent_details.location}"
+
+class BankStorage(Location):
+    def __init__(self, pos):
+        tab = 1 + int((pos - 1) / 30)
+        slot = 1 + int((pos -1) % 30)
+        Location.__init__(self, Location.BANK, tab, slot)
+        
+# Obects to manage the search process and results
+
+class SearchFilter(object):
+    def __init__(self, args=None):
+        self.args = args
+        self.character = True
+        self.armory = True
+        self.shared = True
+        self.bank = True
+        self.materials = True
+        if args:
+            self._parse_args()
+
+    def _parse_args(self):
+        if (self.args.character or self.args.search_bank or
+                self.args.search_shared_inventory or
+                self.args.search_legendary_armory or
+                self.args.search_material_storage):
+            # Turn them all off, until we find the option than enables them
+            self.character = False
+            self.armory = False
+            self.shared = False
+            self.bank = False
+            self.materials = False
+            # figure out what was enabled
+            if self.args.character:
+                self.character = True
+            if self.args.search_bank:
+                self.bank = True
+            if self.args.search_shared_inventory:
+                self.shared = True
+            if self.args.search_legendary_armory:
+                self.armory = True
+            if self.args.search_material_storage:
+                self.materials = True
+    
+    def __repr__(self):
+        return f"char: {self.character} bank: {self.bank} shared: {self.shared} armory: {self.armory}"
+
+
+# manage searching for the item
+class InventorySearch(object):
+    def __init__(self, client=None, args=None):
+        self.client = client
+        self.args = args
+        self.auth = args.api_key
+        self.characters = None
+        self.bank = None
+        self.materials = None
+        self.shared_inventory = None
+        self.legendary_armory = None
+        # these are used to resolve IDs of item attributes, etc.
+        self.stats_table = None
+        self.materials_categories = {}
+        # if we look up an item by ID, store it here.  First we'll store True,
+        # indicating that we've made the request.  Once we have the answer,
+        # we'll replace True with its actual value.
+        self.looked_up_items = {}
+        # Map item IDs to their locations
+        self.location_map = {}
+        # if we found a match, print it
+        self.found = None
+
+    def process_looked_up_items(self, item_list):
+        # make sure the task finished with an item fetched
+        # NOTE: rather than just a list of items, the json will be an array of
+        # item lists, because the asyncio.gather() will give you an array of
+        # whatever the requests returned.  Since each task is looking up a list
+        # of IDs, which gives an array of the items, this means you get an array
+        # of arrays of items, so we need an extra level to process them.
+        for item in item_list:
+            print(item)
+            name = item['name']
+            data = name.lower()
+            if self.args.rarity or self.args.weight_class:
+                if self.args.rarity: 
+                    if 'rarity' not in item:
+                        continue
+                    if self.args.rarity.lower() != item['rarity'].lower():
+                        continue
+                if self.args.weight_class:
+                    if item['type'] != "Armor":
+                        continue
+                    if 'details' not in item:
+                        continue
+                    if 'weight_class' not in item['details']:
+                        continue
+                    if item['details']['weight_class'].lower() != self.args.weight_class.lower():
+                        continue
+            if self.args.type:
+                match = False
+                if 'type' in item:
+                    if item['type'].lower() == self.args.type.lower():
+                        match = True
+                if not match and 'details' in item:
+                    if 'type' in item['details']:
+                        if item['details']['type'].lower() == self.args.type.lower():
+                            match = True
+                if not match:
+                    continue
+            # if we got here, matches specified rarity and/or weight class.
+            # If no item name was specified, add it.  If one was, make sure
+            # it matches, either exactly or by regex if that was requested.
+            if self.args.item_name: 
+                if self.args.match_regex:
+                    match = self.args.item_name.lower()
+                    mobj = re.search(match, data)
+                    if mobj is None:
+                        continue
+                else:
+                    if self.args.item_name.lower() != name.lower():
+                        continue
+            # If user requested a specific slot, match on that...
+            if self.args.slot:
+                matched = False
+                locations = self.location_map[item['id']]
+                for location in locations:
+                    match = self.args.slot.lower()
+                    mobj = re.search(match, location.slot_number.lower())
+                    if mobj:
+                        matched = True
+                        break
+                if not matched:
+                    continue
+            # If we got here, any specified slot matches.  Finally add it!
+            if self.found is None:
+                self.found = {}
+            for details in self.location_map[item['id']]:
+                adjusted_name = details.get_adjusted_name(self.stats_table, item)
+                if not adjusted_name in self.found:
+                    self.found[adjusted_name] = []
+                self.found[adjusted_name].append(details)
+
+    def get_item_and_upgrade_ids(self, item_details):
+        item = item_details.item
+        loc = item_details.location
+        item_ids = []
+        # Add its details to the map.
+        if 'count' in item and item['count'] > 1:
+            item_details.count = item['count']
+        item_details.stat_id = self.get_stat_id(item)
+        if item['id'] not in self.location_map:
+            self.location_map[item['id']] = []
+        self.location_map[item['id']].append(item_details)
+        # if we haven't looked this item up before, add its id to the list of
+        # ids to look up and mark it as looked up.
+        if item['id'] not in self.looked_up_items:
+            if self.args.debug:
+                print(f"  Fetching item in {loc}")
+            self.looked_up_items[item['id']] = True
+            item_ids.append(item['id'])
+        # Also add upgrades if the item has them
+        if 'upgrades' in item:
+            upgrade_loc = Upgrade(item_details)
+            upgrade_loc.stat_id = None
+            for upgrade_id in item['upgrades']:
+                upgrade = {'id': upgrade_id }
+                upgrade_details = ItemDetails(upgrade, upgrade_loc)
+                if upgrade_id in self.looked_up_items:
+                    continue
+                if upgrade_id not in self.location_map:
+                    self.location_map[upgrade_id] = []
+                self.location_map[upgrade_id].append(upgrade_details)
+                if self.args.debug:
+                    print(f"    Fetching upgrade item in {loc}")
+                item_ids.append(upgrade_id)
+        # Also add infusions if the item has them
+        if 'infusions' in item:
+            infusion_loc = Upgrade(item_details)
+            for infusion_id in item['infusions']:
+                infusion = {'id': infusion_id}
+                infusion_details = ItemDetails(infusion, infusion_loc)
+                if infusion_id not in self.location_map:
+                    self.location_map[infusion_id] = []
+                self.location_map[infusion_id].append(infusion_details)
+                if infusion_id not in self.looked_up_items:
+                    if self.args.debug:
+                        print(f"    Fetching infusion item in {loc}")
+                    item_ids.append(infusion_id)
+        return map(str, item_ids)
+
+
+    async def get_item_tasks(self, max_concurrent=200):
+        # To improve performance, we'll collect the item IDs we need and then
+        # map the ID to its location for lookup later.  Limit the number of IDs
+        # per task to max_concurrent.
+        item_id_list = []
+        item_tasks = []
+        # API only allows 200 items at once
+        if max_concurrent > 200:
+            max_concurrent = 200
+
+        if self.characters:
+            for char in self.characters:
+                # If the user specified a character, 
+                if self.args.character and self.args.character != "all":
+                    if self.args.character.lower() != char['name'].lower():
+                        continue
+                # Check item IDs from inventory bag slots
+                if 'bags' not in char:
+                    print(f"No inventory found for character {char['name']}, continuing.")
+                    continue
+                if self.args.verbose:
+                    print(f"Checking inventory for character {char['name']}")
+                bag_num = 0
+                for bag in char['bags']:
+                    bag_num += 1
+                    if not bag:
+                        continue
+                    item_slot = 0
+                    for item in bag['inventory']:
+                        item_slot += 1
+                        if not item:
+                            continue
+                        # Determine character/account binding and location
+                        bound_to = None
+                        if 'binding' in item:
+                            bound_to = item['binding']
+                        if bound_to and 'bound_to' in item:
+                            bound_to = item['bound_to']
+                        loc = Inventory(char['name'], bag_num, item_slot)
+                        item_details = ItemDetails(item, loc)
+                        item_ids = self.get_item_and_upgrade_ids(item_details)
+                        item_id_list.extend(item_ids)
+
+                # Check equipped items too
+                if 'equipment' in char:
+                    if self.args.verbose:
+                        print(f"Checking equipped items for character {char['name']}")
+                    for item in char['equipment']:
+                        loc = Equipped(char['name'], item['slot'])
+                        item_details = ItemDetails(item, loc)
+                        item_ids = self.get_item_and_upgrade_ids(item_details)
+                        item_id_list.extend(item_ids)
+    
+        if self.bank:
+            slot = 0
+            for item in self.bank:
+                slot += 1
+                if item is None:
+                    continue
+                bound_to = None
+                if 'binding' in item:
+                    bound_to = item['binding']
+                if bound_to and 'bound_to' in item:
+                    bound_to = item['bound_to']
+                loc = BankStorage(slot)
+                item_details = ItemDetails(item, loc)
+                item_details.bound_to = bound_to
+                item_ids = self.get_item_and_upgrade_ids(item_details)
+                item_id_list.extend(item_ids)
+
+        if self.shared_inventory:
+            slot = 0
+            for item in self.shared_inventory:
+                slot += 1
+                if item is None:
+                    continue
+                loc = Location(Location.SHARED, None, slot)
+                item_details = ItemDetails(item, loc)
+                item_ids = self.get_item_and_upgrade_ids(item_details)
+                item_id_list.extend(item_ids)
+
+        if self.materials:
+            for item in self.materials:
+                if item['count'] == 0:
+                    continue
+                loc = MaterialStorage(item, self.materials_categories)
+                item_details = ItemDetails(item, loc)
+                item_ids = self.get_item_and_upgrade_ids(item_details)
+                item_id_list.extend(item_ids)
+
+        if self.legendary_armory:
+            slot = 0
+            for item in self.legendary_armory:
+                slot += 1
+                if item is None:
+                    continue
+                loc = Location(Location.ARMORY, None, slot)
+                item_ids = self.get_item_and_upgrade_ids(item_details)
+                item_id_list.extend(item_ids)
+
+        # now create the tasks, one per max_concurrent items.
+        id_sets = []
+        while len(item_id_list) > max_concurrent:
+            id_sets.append(item_id_list[0:max_concurrent - 1])
+            item_id_list = item_id_list[max_concurrent:]
+        id_sets.append(item_id_list)
+
+        for id_set in id_sets:
+            ids = ','.join(id_set)
+            await self.client.add_request(ItemsRequest(self, ids, self.auth))
+        responses = await self.client.sync()
+        item_list = []
+        for response in responses:
+            item_list.extend(response.json)
+        return item_list
+
+
+    # get_item_index() - Takes an inventory dictionary.  Trinkets need special
+    # handling so we can identify what stats they have.  Calculate an index
+    # based on the item's ID, and the ID of its stats.  Returns a tuple
+    # containing the ID, and the stat name.  This will be used for the location
+    # map entries.
+    def get_stat_id(self, item):
+        rc = None
+        if 'stats' in item:
+            rc = item['stats']['id']
+        return rc
+
+
+async def main():
+    # parse command line options
+    global args
+    cli = argparse.ArgumentParser(description="""\
+Search a Guild Wars 2 account for a specified item. Currently can search \
+character inventory including equipped items, account bank, shared inventory, \
+and legendary armory.  Does not (yet) search material storage, or inactive \
+gear template tabs.""",
+        epilog="""\
+item_name can be omitted, in which case the tool will list everything on the \
+account, unless limited by other options specified.
+
+Valid values for --slot are:
+
+    HelmAquatic
+    Backpack
+    Coat
+    Boots
+    Gloves
+    Helm
+    Leggings
+    Shoulders
+    Accessory1
+    Accessory2
+    Ring1
+    Ring2
+    Amulet
+    WeaponAquaticA
+    WeaponAquaticB
+    WeaponA1
+    WeaponA2
+    WeaponB1
+    WeaponB2
+    Sickle
+    Axe
+    Pick
+
+Valid values for --type are:
+
+    Armor
+    Back
+    Bag
+    Consumable
+    Container
+    CraftingMaterial
+    Gathering
+    Gizmo
+    Key
+    MiniPet
+    Tool
+    Trait
+    Trinket
+    Trophy
+    UpgradeComponent
+    Weapon
+
+Valid values for --rarity are:
+
+    Junk
+    Basic
+    Fine
+    Masterwork
+    Rare
+    Exotic
+    Ascended
+    Legendary
+""")
+
+    cli.add_argument("-v", "--verbose", help="give verbose output", action="store_true")
+    cli.add_argument("-D", "--debug", help="give debugging output", action="store_true")
+    cli.add_argument("-a", "--api-key", required=True, help="specify Guild Wars 2 API key")
+    cli.add_argument("-m", "--match-regex", action="store_true",
+                     help="match item name with regular expressions instead of exact match")
+    cli.add_argument("-r", "--rarity", help="only list items with the given rarity")
+    cli.add_argument("-s", "--slot", help="search equipped gear by gear slot")
+    cli.add_argument("-t", "--type", help="search by item type (armor, trinket, ring, etc.")
+    cli.add_argument("-w", "--weight-class", help="only list armor of a given weight class")
+    cli.add_argument("-B", "--search-bank", help="search account bank", action="store_true")
+    cli.add_argument("-C", "--character", nargs="?", const="all", action='store',
+                     default=None, help="search specified character [search all chars by default]")
+    cli.add_argument("-L", "--search-legendary-armory", action="store_true",
+                     help="search legendary armory")
+    cli.add_argument("-M", "--search-material-storage", action="store_true",
+                     help="search material storage")
+    cli.add_argument("-S", "--search-shared-inventory", action="store_true",
+                     help="search shared inventory slots")
+    cli.add_argument("item_name", nargs="?", help="item you wish to search for")
+    args = cli.parse_args()
+
+    # Set search filters
+    sf = SearchFilter(args)
+
+    # set up logging, maybe?
+    logging.basicConfig(level=logging.DEBUG)
+
+    async with aiohttp.ClientSession() as client:
+        http = AsyncIOHTTP(client, args.verbose)
+        ctx = InventorySearch(http, args)
+        auth = args.api_key
+        if args.verbose:
+            print("Fetching stat combinations...")
+        await http.add_request(StatComboRequest(ctx, auth))
+        if sf.character:
+            # get set of characters on account
+            if args.verbose:
+                print("Fetching characters on account...")
+            await http.add_request(CharacterRequest(ctx, auth))
+        if sf.bank:
+            if args.verbose:
+                print("Fetching account bank contents...")
+            await http.add_request(BankRequest(ctx, auth))
+        if sf.shared:
+            if args.verbose:
+                print("Fetching shared inventory contents...")
+            await http.add_request(SharedInventoryRequest(ctx, auth))
+        if sf.armory:
+            if args.verbose:
+                print("Fetching legendary armory contents...")
+            await http.add_request(LegendaryArmoryRequest(ctx, auth))
+        if sf.materials:
+            if args.verbose:
+                print("Fetching material storage categories...")
+            # Unfortunately this just gives us a list of the IDs of the
+            # categories, which we need to actually fetch the categories.  We'll
+            # have to request those after.
+            # FIXME:  Use ids=all
+            await http.add_request(MaterialsCategoriesRequest(ctx, auth))
+            # Request the actual items in material storage for the account
+            await http.add_request(MaterialsRequest(ctx, auth))
+        responses = await http.sync()
+
+        # fetch item definitions from all of the above
+        if args.verbose:
+            print("Fetching item definitions for found items...")
+        items = await ctx.get_item_tasks()
+        ctx.process_looked_up_items(items)
+    
+    # Now just tell the user what we found:
+
+    if ctx.found is None:
+        print("No matching item found on your account.")
+    else:
+        for item in sorted(ctx.found.keys()):
+            print(f"{item}:")
+            # if args.slot is set, we matched by slot. But the location map for the
+            # matching item contains ALL the locations where the item matched.  Only
+            # show the ones that match the slot...
+            if args.slot:
+                for details in ctx.found[item]:
+                        location = details.location
+                        match = args.slot.lower()
+                        mobj = re.search(match, location.slot_number.lower())
+                        if mobj:
+                            print(f"    {location}")
+            else:
+                for details in ctx.found[item]:
+                    print(f"    {details.location}")
+    
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(main())
