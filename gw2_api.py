@@ -433,7 +433,6 @@ class InventorySearch(object):
         # of IDs, which gives an array of the items, this means you get an array
         # of arrays of items, so we need an extra level to process them.
         for item in item_list:
-            print(item)
             name = item['name']
             data = name.lower()
             if self.args.rarity or self.args.weight_class:
