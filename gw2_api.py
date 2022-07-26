@@ -1,5 +1,33 @@
 #!/usr/bin/python
 
+# Copyright 2021-2022 Derek Martin <code@pizzashack.org>
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its contributors
+# may be used to endorse or promote products derived from this software without
+# specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
 import sys, os
 import copy
 import aiohttp
@@ -20,19 +48,45 @@ class Request(object):
         self.method = method
         self.headers = None
         self.data = data
-        self.response = Response()
+        self.response = Response(url)
  
+    def method_to_str(self):
+        rc = ''
+        if self.method == Request.GET:
+            rc = "Request.GET"
+        elif self.method == Request.POST:
+            rc = "Request.POST"
+        else:
+            rc = "(unknown method)"
+        return rc
+
     def __repr__(self):
-        return f"url='{self.url}', method={self.method}, headers='{self.headers}' response={self.response}"
+        return f"Request('{self.url}', {self.method_to_str()}, data='{self.data}')"
+
+# Client request exception
+class RequestError(Exception):
+    def __init__(self, url, status, message):
+        self.url = url
+        self.status = status
+        self.message = message
+
+    def __str__(self):
+        return f"{self.url} - {self.status}: {self.message}"
+
+    def __repr__(self):
+        return f"RequestError({self.url}, {self.status}, {self.message})"
 
 # Response Base Class
 class Response(object):
-    def __init__(self):
+    def __init__(self, url):
         self.data = None
         self.text = None
+        self.url = url
 
     async def parse(self, response):
         self.data = response
+        if self.data.status < 200 or self.data.status >= 300:
+            raise RequestError(self.data.status, self.data.message)
         self.text = await response.text()
 
     def get_content(self):
@@ -70,7 +124,7 @@ class GW2APIRequest(Request):
         Request.__init__(self, f"{self.base_url}/{url}", Request.GET)
         self.auth_header = { "Authorization": f"Bearer {auth}" }
         self.headers = self.auth_header
-        self.response = JSONResponse(ctx)
+        self.response = JSONResponse(ctx, self.url)
 
 
 # request types for the definitions of things
@@ -78,18 +132,18 @@ class GW2APIRequest(Request):
 class StatComboRequest(GW2APIRequest):
     def __init__(self, ctx, auth):
         GW2APIRequest.__init__(self, ctx, "itemstats?ids=all", auth)
-        self.response = StatComboResponse(ctx)
+        self.response = StatComboResponse(ctx, self.url)
 
 class MaterialsCategoriesRequest(GW2APIRequest):
     def __init__(self, ctx, auth, category=None):
         url = 'materials?ids=all'
         GW2APIRequest.__init__(self, ctx, 'materials?ids=all', auth)
-        self.response = MaterialsCategoriesResponse(ctx)
+        self.response = MaterialsCategoriesResponse(ctx, self.url)
 
 class ItemsRequest(GW2APIRequest):
     def __init__(self, ctx, ids, auth):
         GW2APIRequest.__init__(self, ctx, f"items?ids={ids}", auth)
-        self.response = ItemsResponse(ctx)
+        self.response = ItemsResponse(ctx, self.url)
         if args.debug:
             print(f"  fetching definition for ids: {ids}")
 
@@ -98,49 +152,51 @@ class ItemsRequest(GW2APIRequest):
 class CharacterRequest(GW2APIRequest):
     def __init__(self, ctx, auth):
         GW2APIRequest.__init__(self, ctx, "characters?ids=all", auth)
-        self.response = CharacterResponse(ctx)
+        self.response = CharacterResponse(ctx, self.url)
 
 class BankRequest(GW2APIRequest):
     def __init__(self, ctx, auth):
         GW2APIRequest.__init__(self, ctx, "account/bank", auth)
-        self.response = BankResponse(ctx)
+        self.response = BankResponse(ctx, self.url)
 
 class SharedInventoryRequest(GW2APIRequest):
     def __init__(self, ctx, auth):
         GW2APIRequest.__init__(self, ctx, "account/inventory", auth)
-        self.response = SharedInventoryResponse(ctx)
+        self.response = SharedInventoryResponse(ctx, self.url)
 
 class MaterialsRequest(GW2APIRequest):
     def __init__(self, ctx, auth):
         GW2APIRequest.__init__(self, ctx, "account/materials", auth)
-        self.response = MaterialsResponse(ctx)
+        self.response = MaterialsResponse(ctx, self.url)
 
 class LegendaryArmoryRequest(GW2APIRequest):
     def __init__(self, ctx, auth):
         GW2APIRequest.__init__(self, ctx, "account/legendaryarmory", auth)
-        self.response = LegendaryArmoryResponse(ctx)
+        self.response = LegendaryArmoryResponse(ctx, self.url)
 
 # GW2 Response objects
 
 # API returns everything as JSON
 class JSONResponse(Response):
-    def __init__(self, ctx):
-        Response.__init__(self)
+    def __init__(self, ctx, url):
+        Response.__init__(self, url)
         self.ctx = ctx
         self.json = None
 
     async def parse(self, response):
+        if response.status < 200 or response.status >= 300:
+            raise RequestError(self.url, response.status, response.reason)
         self.json = await response.json()
 
     def get_content(self):
         return self.json
 
 class StatComboResponse(JSONResponse):
-    def __init__(self, ctx):
-        JSONResponse.__init__(self, ctx)
+    def __init__(self, ctx, url):
+        JSONResponse.__init__(self, ctx, url)
 
     async def parse(self, response):
-        self.json = await response.json()
+        await JSONResponse.parse(self, response)
         self.ctx.stats_table = {}
         if self.ctx.args.debug:
             print("Fetched stat combinations")
@@ -151,22 +207,24 @@ class StatComboResponse(JSONResponse):
                 print(f"  {stat}: {self.ctx.stats_table[stat]}")
 
 class CharacterResponse(JSONResponse):
-    def __init__(self, ctx):
-        JSONResponse.__init__(self, ctx)
+    def __init__(self, ctx, url):
+        JSONResponse.__init__(self, ctx, url)
 
     async def parse(self, response):
-        self.ctx.characters = await response.json()
+        await JSONResponse.parse(self, response)
+        self.ctx.characters = self.json
         if args.debug:
             print("Fetched account characters")
             for char in self.ctx.characters:
                 print(f"  found character {char['name']}")
 
 class BankResponse(JSONResponse):
-    def __init__(self, ctx):
-        JSONResponse.__init__(self, ctx)
+    def __init__(self, ctx, url):
+        JSONResponse.__init__(self, ctx, url)
 
     async def parse(self, response):
-        self.ctx.bank = await response.json()
+        await JSONResponse.parse(self, response)
+        self.ctx.bank = self.json
         if args.debug:
             print("Fetched items from bank.")
         for item in self.ctx.bank:
@@ -176,11 +234,12 @@ class BankResponse(JSONResponse):
 
 
 class SharedInventoryResponse(JSONResponse):
-    def __init__(self, ctx):
-        JSONResponse.__init__(self, ctx)
+    def __init__(self, ctx, url):
+        JSONResponse.__init__(self, ctx, url)
 
     async def parse(self, response):
-        self.ctx.shared_inventory = await response.json()
+        await JSONResponse.parse(self, response)
+        self.ctx.shared_inventory = self.json
         if args.debug:
             print("Fetched items from shared inventory.")
             for item in self.ctx.shared_inventory:
@@ -188,24 +247,26 @@ class SharedInventoryResponse(JSONResponse):
                     print(f"  fetched item {item['id']} from shared inventory")
 
 class MaterialsResponse(JSONResponse):
-    def __init__(self, ctx):
-        JSONResponse.__init__(self, ctx)
+    def __init__(self, ctx, url):
+        JSONResponse.__init__(self, ctx, url)
 
     async def parse(self, response):
-        self.ctx.materials = await response.json()
+        await JSONResponse.parse(self, response)
+        self.ctx.materials = self.json
         if args.debug:
             print("Fetched items from materials.")
             for item in self.ctx.materials:
                 print(f"  fetched item {item['id']} from material storage")
 
 class MaterialsCategoriesResponse(JSONResponse):
-    def __init__(self, ctx):
-        JSONResponse.__init__(self, ctx)
+    def __init__(self, ctx, url):
+        JSONResponse.__init__(self, ctx, url)
 
     async def parse(self, response):
         # Child response.  Add its materials to the materials map, but only
         # if the player has some of the given material.
-        categories = await response.json()
+        await JSONResponse.parse(self, response)
+        categories = self.json
         if args.debug:
             print(f"Fetched categories in materials storage")
         for category in categories:
@@ -215,23 +276,23 @@ class MaterialsCategoriesResponse(JSONResponse):
                     print(f"  fetched category {category['name']}")
 
 class LegendaryArmoryResponse(JSONResponse):
-    def __init__(self, ctx):
-        JSONResponse.__init__(self, ctx)
+    def __init__(self, ctx, url):
+        JSONResponse.__init__(self, ctx, url)
 
     async def parse(self, response):
-        self.ctx.legendary_armory = await response.json()
+        await JSONResponse.parse(self, response)
+        self.ctx.legendary_armory = self.json
         if args.debug:
             print("Fetched items from legendary_armory.")
             for item in self.ctx.legendary_armory:
                 print(f"  fetched item {item['id']} from legendary armory")
 
 class ItemsResponse(JSONResponse):
-    def __init__(self, ctx):
-        JSONResponse.__init__(self, ctx)
+    def __init__(self, ctx, url):
+        JSONResponse.__init__(self, ctx, url)
 
     async def parse(self, response):
-        self.data = response
-        self.json = await response.json()
+        await JSONResponse.parse(self, response)
 
     def get_content(self):
         if args.debug:
@@ -251,6 +312,13 @@ class ItemDetails(object):
         self.location = location
         self.stat_id = None
         self.bound_to = bound_to
+
+    def __str__(self):
+        bound_to = ""
+        if self.bound_to:
+            bound_to = f"(bound to {self.bound_to}) "
+        d = f"({self.count}) {bound_to}loc: {self.location}"
+        return d
 
     def get_adjusted_name(self, stat_table, item):
         name = item['name']
@@ -379,7 +447,8 @@ class SearchFilter(object):
         if (self.args.character or self.args.search_bank or
                 self.args.search_shared_inventory or
                 self.args.search_legendary_armory or
-                self.args.search_material_storage):
+                self.args.search_material_storage or
+                self.args.slot):
             # Turn them all off, until we find the option than enables them
             self.character = False
             self.armory = False
@@ -387,7 +456,7 @@ class SearchFilter(object):
             self.bank = False
             self.materials = False
             # figure out what was enabled
-            if self.args.character:
+            if self.args.character or self.args.slot:
                 self.character = True
             if self.args.search_bank:
                 self.bank = True
@@ -433,8 +502,7 @@ class InventorySearch(object):
         # of IDs, which gives an array of the items, this means you get an array
         # of arrays of items, so we need an extra level to process them.
         for item in item_list:
-            name = item['name']
-            data = name.lower()
+            name = item['name'].lower()
             if self.args.rarity or self.args.weight_class:
                 if self.args.rarity: 
                     if 'rarity' not in item:
@@ -467,7 +535,7 @@ class InventorySearch(object):
             if self.args.item_name: 
                 if self.args.match_regex:
                     match = self.args.item_name.lower()
-                    mobj = re.search(match, data)
+                    mobj = re.search(match, name)
                     if mobj is None:
                         continue
                 else:
@@ -476,16 +544,20 @@ class InventorySearch(object):
             # If user requested a specific slot, match on that...
             if self.args.slot:
                 matched = False
-                locations = self.location_map[item['id']]
-                for location in locations:
+                details_list = self.location_map[item['id']]
+                for item_details in details_list:
+                    location = item_details.location
+                    if not hasattr(location, 'slot_name'):
+                        continue
                     match = self.args.slot.lower()
-                    mobj = re.search(match, location.slot_number.lower())
+                    mobj = re.search(match, location.slot_name.lower())
                     if mobj:
                         matched = True
                         break
+                # if current item isn't in right slot, skip to next one
                 if not matched:
                     continue
-            # If we got here, any specified slot matches.  Finally add it!
+            # If we got here, the specified item matches.  Finally add it!
             if self.found is None:
                 self.found = {}
             for details in self.location_map[item['id']]:
@@ -554,47 +626,60 @@ class InventorySearch(object):
             max_concurrent = 200
 
         if self.characters:
+            character_matches = False
             for char in self.characters:
                 # If the user specified a character, 
                 if self.args.character and self.args.character != "all":
                     if self.args.character.lower() != char['name'].lower():
                         continue
-                # Check item IDs from inventory bag slots
-                if 'bags' not in char:
-                    print(f"No inventory found for character {char['name']}, continuing.")
-                    continue
-                if self.args.verbose:
-                    print(f"Checking inventory for character {char['name']}")
-                bag_num = 0
-                for bag in char['bags']:
-                    bag_num += 1
-                    if not bag:
-                        continue
-                    item_slot = 0
-                    for item in bag['inventory']:
-                        item_slot += 1
-                        if not item:
-                            continue
-                        # Determine character/account binding and location
-                        bound_to = None
-                        if 'binding' in item:
-                            bound_to = item['binding']
-                        if bound_to and 'bound_to' in item:
-                            bound_to = item['bound_to']
-                        loc = Inventory(char['name'], bag_num, item_slot)
-                        item_details = ItemDetails(item, loc)
-                        item_ids = self.get_item_and_upgrade_ids(item_details)
-                        item_id_list.extend(item_ids)
+                character_matches = True
 
-                # Check equipped items too
+                # Check equipped items.  If a slot was specified, ignore items
+                # not in slots matching the specified regex
                 if 'equipment' in char:
                     if self.args.verbose:
                         print(f"Checking equipped items for character {char['name']}")
                     for item in char['equipment']:
+                        if args.slot:
+                            match = args.slot.lower()
+                            mobj = re.search(match, item['slot'].lower())
+                            if not mobj:
+                                continue
                         loc = Equipped(char['name'], item['slot'])
                         item_details = ItemDetails(item, loc)
                         item_ids = self.get_item_and_upgrade_ids(item_details)
                         item_id_list.extend(item_ids)
+
+                else:
+                    # Check item IDs from inventory bag slots
+                    if 'bags' not in char:
+                        print(f"No inventory found for character {char['name']}, continuing.")
+                        continue
+                    if self.args.verbose:
+                        print(f"Checking inventory for character {char['name']}")
+                    bag_num = 0
+                    for bag in char['bags']:
+                        bag_num += 1
+                        if not bag:
+                            continue
+                        item_slot = 0
+                        for item in bag['inventory']:
+                            item_slot += 1
+                            if not item:
+                                continue
+                            # Determine character/account binding and location
+                            bound_to = None
+                            if 'binding' in item:
+                                bound_to = item['binding']
+                            if bound_to and 'bound_to' in item:
+                                bound_to = item['bound_to']
+                            loc = Inventory(char['name'], bag_num, item_slot)
+                            item_details = ItemDetails(item, loc)
+                            item_ids = self.get_item_and_upgrade_ids(item_details)
+                            item_id_list.extend(item_ids)
+    
+            if not character_matches:
+                print(f'WARNING: No character "{self.args.character}" found on account.')
     
         if self.bank:
             slot = 0
@@ -648,7 +733,10 @@ class InventorySearch(object):
         while len(item_id_list) > max_concurrent:
             id_sets.append(item_id_list[0:max_concurrent - 1])
             item_id_list = item_id_list[max_concurrent:]
-        id_sets.append(item_id_list)
+        if item_id_list:
+            id_sets.append(item_id_list)
+        if not id_sets:
+            return None
 
         for id_set in id_sets:
             ids = ','.join(id_set)
@@ -660,11 +748,7 @@ class InventorySearch(object):
         return item_list
 
 
-    # get_item_index() - Takes an inventory dictionary.  Trinkets need special
-    # handling so we can identify what stats they have.  Calculate an index
-    # based on the item's ID, and the ID of its stats.  Returns a tuple
-    # containing the ID, and the stat name.  This will be used for the location
-    # map entries.
+    # get the id of the stat combo of the item, if it has one
     def get_stat_id(self, item):
         rc = None
         if 'stats' in item:
@@ -794,10 +878,7 @@ Valid values for --rarity are:
         if sf.materials:
             if args.verbose:
                 print("Fetching material storage categories...")
-            # Unfortunately this just gives us a list of the IDs of the
-            # categories, which we need to actually fetch the categories.  We'll
-            # have to request those after.
-            # FIXME:  Use ids=all
+            # Fetch the material storage categories and their contents
             await http.add_request(MaterialsCategoriesRequest(ctx, auth))
             # Request the actual items in material storage for the account
             await http.add_request(MaterialsRequest(ctx, auth))
@@ -807,29 +888,19 @@ Valid values for --rarity are:
         if args.verbose:
             print("Fetching item definitions for found items...")
         items = await ctx.get_item_tasks()
-        ctx.process_looked_up_items(items)
+        if items:
+            ctx.process_looked_up_items(items)
     
     # Now just tell the user what we found:
 
     if ctx.found is None:
         print("No matching item found on your account.")
     else:
+        # Print all the matching items and their locations
         for item in sorted(ctx.found.keys()):
             print(f"{item}:")
-            # if args.slot is set, we matched by slot. But the location map for the
-            # matching item contains ALL the locations where the item matched.  Only
-            # show the ones that match the slot...
-            if args.slot:
-                for details in ctx.found[item]:
-                        location = details.location
-                        match = args.slot.lower()
-                        mobj = re.search(match, location.slot_number.lower())
-                        if mobj:
-                            print(f"    {location}")
-            else:
-                for details in ctx.found[item]:
-                    print(f"    {details.location}")
-    
+            for details in ctx.found[item]:
+                print(f"    {details.location}")
 
 loop = asyncio.get_event_loop()
 loop.run_until_complete(main())
