@@ -650,34 +650,33 @@ class InventorySearch(object):
                         item_ids = self.get_item_and_upgrade_ids(item_details)
                         item_id_list.extend(item_ids)
 
-                else:
-                    # Check item IDs from inventory bag slots
-                    if 'bags' not in char:
-                        print(f"No inventory found for character {char['name']}, continuing.")
+                # Check item IDs from inventory bag slots
+                if 'bags' not in char:
+                    print(f"No inventory found for character {char['name']}, continuing.")
+                    continue
+                if self.args.verbose:
+                    print(f"Checking inventory for character {char['name']}")
+                bag_num = 0
+                for bag in char['bags']:
+                    bag_num += 1
+                    if not bag:
                         continue
-                    if self.args.verbose:
-                        print(f"Checking inventory for character {char['name']}")
-                    bag_num = 0
-                    for bag in char['bags']:
-                        bag_num += 1
-                        if not bag:
+                    item_slot = 0
+                    for item in bag['inventory']:
+                        item_slot += 1
+                        if not item:
                             continue
-                        item_slot = 0
-                        for item in bag['inventory']:
-                            item_slot += 1
-                            if not item:
-                                continue
-                            # Determine character/account binding and location
-                            bound_to = None
-                            if 'binding' in item:
-                                bound_to = item['binding']
-                            if bound_to and 'bound_to' in item:
-                                bound_to = item['bound_to']
-                            loc = Inventory(char['name'], bag_num, item_slot)
-                            item_details = ItemDetails(item, loc)
-                            item_ids = self.get_item_and_upgrade_ids(item_details)
-                            item_id_list.extend(item_ids)
-    
+                        # Determine character/account binding and location
+                        bound_to = None
+                        if 'binding' in item:
+                            bound_to = item['binding']
+                        if bound_to and 'bound_to' in item:
+                            bound_to = item['bound_to']
+                        loc = Inventory(char['name'], bag_num, item_slot)
+                        item_details = ItemDetails(item, loc)
+                        item_ids = self.get_item_and_upgrade_ids(item_details)
+                        item_id_list.extend(item_ids)
+
             if not character_matches:
                 print(f'WARNING: No character "{self.args.character}" found on account.')
     
